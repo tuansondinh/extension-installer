@@ -1,0 +1,30 @@
+{
+  "name": "pi-extension-installer",
+  "version": "1.0.0",
+  "description": "Browse and install Pi community packages — paginated npm registry browser with search, previews, download counts, and installed markers",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi",
+    "extensions",
+    "installer",
+    "registry"
+  ],
+  "main": "dist/extensions.js",
+  "types": "dist/extensions.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.0.0"
+  }
+}
