@@ -21,8 +21,9 @@ interface Package {
   id: number;
   name: string;
   description: string;
-  npm?: string;    // npmjs.com URL
-  github?: string; // GitHub repo URL
+  downloads?: number; // last-month download count from api.npmjs.org
+  npm?: string;       // npmjs.com URL
+  github?: string;    // GitHub repo URL
 }
 
 // Partial shape of the npm registry search response we care about.
@@ -85,66 +86,50 @@ function wrapText(text: string, width: number): string[] {
 }
 
 // =============================================================================
-// Curated fallback packages
-// Shown when the npm registry is unreachable. Kept in sync with the npm
-// keyword `pi-package` — update as new notable packages appear.
-// =============================================================================
-
-const FALLBACK: Omit<Package, "id">[] = [
-  {
-    name: "@nicopreme/pi-subagents",
-    description: "Delegate tasks to subagents with chains & parallel execution",
-    npm: "https://www.npmjs.com/package/@nicopreme/pi-subagents",
-  },
-  {
-    name: "@nicopreme/pi-web",
-    description: "Web search, URL fetch, GitHub clone, PDF, YouTube",
-    npm: "https://www.npmjs.com/package/@nicopreme/pi-web",
-  },
-  {
-    name: "@nicopreme/pi-dev-pipeline",
-    description: "TDD, code review, architecture workflows",
-    npm: "https://www.npmjs.com/package/@nicopreme/pi-dev-pipeline",
-  },
-  {
-    name: "@plannotator/pi-extension",
-    description: "Plan mode with browser UI for review/approval",
-    npm: "https://www.npmjs.com/package/@plannotator/pi-extension",
-  },
-  {
-    name: "@aliou/pi-extension-dev",
-    description: "Tools for developing & updating extensions",
-    npm: "https://www.npmjs.com/package/@aliou/pi-extension-dev",
-  },
-  {
-    name: "git:github.com/ruizrica/agent-pi",
-    description: "43 extensions — multi-agent orchestration suite",
-    github: "https://github.com/ruizrica/agent-pi",
-  },
-  {
-    name: "git:github.com/sids/pi-extensions",
-    description: "plan-md, diff review, subagent delegation",
-    github: "https://github.com/sids/pi-extensions",
-  },
-  {
-    name: "git:github.com/badlogic/pi-doom",
-    description: "Doom. In your terminal. While you wait.",
-    github: "https://github.com/badlogic/pi-doom",
-  },
-];
-
-// =============================================================================
 // npm registry API
 // =============================================================================
 
-const PAGE_SIZE = 20;
+const PAGE_SIZE  = 20;
 const NPM_SEARCH = "https://registry.npmjs.org/-/v1/search";
 const NPM_PKG    = "https://registry.npmjs.org"; // /<name> for full doc + readme
+const NPM_DL     = "https://api.npmjs.org/downloads/point/last-month";
+
+// Formats a raw download count as a compact human-readable string.
+function formatDownloads(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M/mo`;
+  if (n >= 1_000)     return `${(n / 1_000).toFixed(1)}k/mo`;
+  return `${n}/mo`;
+}
+
+// Fetches last-month download counts for a list of package names from the
+// npm downloads API. All requests run in parallel; individual failures are
+// silently ignored so a single bad package never breaks the whole page.
+async function fetchDownloads(names: string[]): Promise<Map<string, number>> {
+  const counts = new Map<string, number>();
+
+  await Promise.all(
+    names.map(async (name) => {
+      try {
+        // Scoped package names (e.g. @scope/pkg) must be percent-encoded.
+        const res = await fetch(`${NPM_DL}/${encodeURIComponent(name)}`, {
+          signal: AbortSignal.timeout(5_000),
+        });
+        if (!res.ok) return;
+        const data = (await res.json()) as { downloads?: number };
+        if (typeof data.downloads === "number") counts.set(name, data.downloads);
+      } catch {
+        // Non-critical — the catalog still renders without this package's count.
+      }
+    })
+  );
+
+  return counts;
+}
 
 // Searches npm for packages tagged `keywords:pi-package`, optionally filtered
 // by an extra query string. Results are ordered by popularity (download weight
-// = 1, quality = 0, maintenance = 0) — the closest the search API gets to
-// "most downloaded" without making per-package download-count requests.
+// = 1, quality = 0, maintenance = 0), then enriched with exact last-month
+// download counts fetched in parallel from the downloads API.
 async function searchNpm(
   query: string,
   page: number
@@ -167,6 +152,8 @@ async function searchNpm(
 
   const data = (await res.json()) as NpmSearchResponse;
 
+  // Build the base package list, then fire off download-count requests for
+  // all names on this page in parallel before we return.
   const packages: Package[] = data.objects.map((obj, i) => {
     const repo   = obj.package.links.repository ?? "";
     const github = repo.includes("github.com") ? repo : undefined;
@@ -179,6 +166,11 @@ async function searchNpm(
       github,
     };
   });
+
+  const counts = await fetchDownloads(packages.map((p) => p.name));
+  for (const pkg of packages) {
+    pkg.downloads = counts.get(pkg.name);
+  }
 
   return { packages, total: data.total };
 }
@@ -223,7 +215,10 @@ function renderPage(
   ];
 
   for (const pkg of packages) {
-    lines.push(`    ${BOLD}${pkg.id}${RESET}  ${GREEN}${pkg.name}${RESET}`);
+    const dlTag = pkg.downloads !== undefined
+      ? `  ${DIM}${formatDownloads(pkg.downloads)}${RESET}`
+      : "";
+    lines.push(`    ${BOLD}${pkg.id}${RESET}  ${GREEN}${pkg.name}${RESET}${dlTag}`);
     lines.push(`       ${DIM}${pkg.description}${RESET}`);
   }
 
@@ -263,10 +258,14 @@ async function showDetail(pkg: Package, notify: (msg: string) => void): Promise<
 
   const truncated = raw && raw.length > 600;
 
+  const dlTag = pkg.downloads !== undefined
+    ? `  ${DIM}${formatDownloads(pkg.downloads)}${RESET}`
+    : "";
+
   const lines: string[] = [
     "",
     rule(),
-    `  ${BOLD}${GREEN}${pkg.name}${RESET}`,
+    `  ${BOLD}${GREEN}${pkg.name}${RESET}${dlTag}`,
     "",
     ...wrapText(readme, 60).map((line) => `  ${line}`),
   ];
@@ -385,16 +384,7 @@ async function extensionsCommand(ctx: PiContext): Promise<void> {
   // ── Initial load ───────────────────────────────────────────────────────────
   ctx.notify(`${DIM}  Fetching packages from npm…${RESET}`);
   const online = await loadPage();
-
-  // If npm was unreachable on the very first load, fall back to the curated
-  // list so the user still has something useful to work with.
-  if (!online) {
-    ctx.notify(`${YELLOW}  Showing curated offline picks instead.${RESET}`);
-    currentPage = FALLBACK.map((p, i) => ({ ...p, id: i + 1 }));
-    total       = currentPage.length;
-    totalPages  = 1;
-    ctx.notify(renderPage(currentPage, page, totalPages, total, query));
-  }
+  if (!online) return; // loadPage already printed the error
 
   // ── Browse loop ────────────────────────────────────────────────────────────
   // Stays open until the user enters a valid selection list (1,3,5) or blanks.
