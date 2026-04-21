@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.0.1] - 2026-04-22
+
+### Bug Fixes
+
+- Readme preview now scrollable with ↑/↓ arrow keys (previously truncated at 800 chars with no scroll)
+- Scroll position indicator shows current line range (e.g. `lines 1–20 of 84`)
+- Any non-arrow key closes the preview
+- Full readme loaded instead of 800-char truncation
+
 ## [1.0.0] - 2026-04-22
 
 ### Features

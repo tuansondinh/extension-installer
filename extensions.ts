@@ -269,6 +269,8 @@ function createBrowserComponent(
   let error               = "";
   let previewPkg: Package | null = null;
   let previewText         = "";
+  let previewScroll       = 0;
+  const PREVIEW_PAGE      = 20;
   const browseSelected    = new Set<string>();
 
   // ── Manage state ──────────────────────────────────────────────────────────
@@ -309,11 +311,12 @@ function createBrowserComponent(
   }
 
   async function loadPreview(pkg: Package) {
-    previewPkg  = pkg;
-    previewText = "Loading readme…";
+    previewPkg    = pkg;
+    previewText   = "Loading readme…";
+    previewScroll = 0;
     refresh();
     const raw   = await fetchReadme(pkg.name);
-    previewText = raw ? stripMarkdown(raw).slice(0, 800) : "(no readme available)";
+    previewText = raw ? stripMarkdown(raw) : "(no readme available)";
     refresh();
   }
 
@@ -390,6 +393,17 @@ function createBrowserComponent(
 
     // ── Preview mode ───────────────────────────────────────────────────────
     if (previewPkg) {
+      const totalLines = previewText.split("\n").length;
+      if (matchesKey(data, Key.up)) {
+        previewScroll = Math.max(0, previewScroll - 1);
+        refresh();
+        return;
+      }
+      if (matchesKey(data, Key.down)) {
+        previewScroll = Math.min(Math.max(0, totalLines - PREVIEW_PAGE), previewScroll + 1);
+        refresh();
+        return;
+      }
       previewPkg = null;
       refresh();
       return;
@@ -492,20 +506,30 @@ function createBrowserComponent(
     }
 
     if (previewPkg) {
-      const pkg = previewPkg;
+      const pkg        = previewPkg;
+      const textLines  = previewText.split("\n");
+      const totalLines = textLines.length;
+      const visLines   = textLines.slice(previewScroll, previewScroll + PREVIEW_PAGE);
+      const canUp      = previewScroll > 0;
+      const canDown    = previewScroll + PREVIEW_PAGE < totalLines;
+
       add(theme.bold(theme.fg("success", ` ${pkg.name}`)) +
         (pkg.downloads !== undefined ? theme.fg("dim", `  ${formatDownloads(pkg.downloads)}`) : "") +
         (installed.has(pkg.name) ? theme.fg("success", "  ✓ installed") : ""));
       add(theme.fg("muted", ` ${pkg.description}`));
+      add(theme.fg("dim", ` lines ${previewScroll + 1}–${Math.min(previewScroll + PREVIEW_PAGE, totalLines)} of ${totalLines}`));
       lines.push("");
-      const textLines = previewText.split("\n");
-      for (const l of textLines.slice(0, 20)) add(` ${l}`);
-      if (textLines.length > 20) add(theme.fg("dim", ` … (${textLines.length - 20} more lines)`));
+      for (const l of visLines) add(` ${l}`);
       lines.push("");
       if (pkg.npm)    add(theme.fg("dim", " npm:    ") + theme.fg("accent", pkg.npm));
       if (pkg.github) add(theme.fg("dim", " github: ") + theme.fg("accent", pkg.github));
       add(sep);
-      add(theme.fg("dim", " Any key to close preview"));
+      const scrollHint = [
+        canUp   ? theme.fg("accent", "↑ scroll up")   : theme.fg("dim", "↑ scroll up"),
+        canDown ? theme.fg("accent", "↓ scroll down") : theme.fg("dim", "↓ scroll down"),
+        theme.fg("dim", "any other key=close"),
+      ].join(theme.fg("dim", "  "));
+      add(` ${scrollHint}`);
       add(sep);
       return;
     }

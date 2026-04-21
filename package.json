@@ -1,6 +1,6 @@
 {
   "name": "pi-extension-installer",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Browse and install Pi community packages — interactive TUI browser with arrow-key navigation, search, previews, install, and uninstall support.",
   "keywords": [
     "pi-package",
@@ -23,7 +23,9 @@
     "node": ">=18.0.0"
   },
   "pi": {
-    "extensions": ["./dist/extensions.js"]
+    "extensions": [
+      "./dist/extensions.js"
+    ]
   },
   "license": "MIT",
   "devDependencies": {
