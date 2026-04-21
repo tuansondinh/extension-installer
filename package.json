@@ -1,7 +1,7 @@
 {
   "name": "pi-extension-installer",
   "version": "1.0.0",
-  "description": "Browse and install Pi community packages — paginated npm registry browser with search, previews, download counts, and installed markers",
+  "description": "Browse and install Pi community packages — interactive TUI browser with arrow-key navigation, search, previews, install, and uninstall support.",
   "keywords": [
     "pi-package",
     "pi-extension",
@@ -22,9 +22,16 @@
   "engines": {
     "node": ">=18.0.0"
   },
+  "pi": {
+    "extensions": ["./dist/extensions.js"]
+  },
   "license": "MIT",
   "devDependencies": {
     "@types/node": "^22.0.0",
     "typescript": "^5.0.0"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "^0.68.0",
+    "@mariozechner/pi-tui": "^0.68.0"
   }
 }

@@ -1,40 +1,27 @@
-import { spawn, spawnSync } from "child_process";
+import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { spawnSync } from "child_process";
+import { readFileSync, writeFileSync } from "fs";
+import { homedir } from "os";
+import { join } from "path";
+import { Key, matchesKey, truncateToWidth } from "@mariozechner/pi-tui";
 
 // =============================================================================
 // Types
 // =============================================================================
 
-interface PiUi {
-  input(prompt: string): Promise<string>;
-  confirm(message: string): Promise<boolean>;
-}
-
-interface PiContext {
-  ui: PiUi;
-  notify(message: string): void;
-  registerCommand(name: string, description: string, handler: () => Promise<void>): void;
-}
-
-// A package entry as used throughout the UI. IDs are 1-based within the
-// current page, so they reset on every page/search change.
 interface Package {
-  id: number;
   name: string;
   description: string;
-  downloads?: number; // last-month download count from api.npmjs.org
-  npm?: string;       // npmjs.com URL
-  github?: string;    // GitHub repo URL
+  downloads?: number;
+  npm?: string;
+  github?: string;
 }
 
-// Partial shape of the npm registry search response we care about.
 interface NpmSearchObject {
   package: {
     name: string;
     description?: string;
-    links: {
-      npm?: string;
-      repository?: string;
-    };
+    links: { npm?: string; repository?: string };
   };
 }
 
@@ -44,116 +31,34 @@ interface NpmSearchResponse {
 }
 
 // =============================================================================
-// ANSI / terminal helpers
+// npm registry
 // =============================================================================
 
-const RESET  = "\x1b[0m";
-const BOLD   = "\x1b[1m";
-const DIM    = "\x1b[2m";
-const CYAN   = "\x1b[36m";
-const YELLOW = "\x1b[33m";
-const GREEN  = "\x1b[32m";
-const RED    = "\x1b[31m";
-
-// OSC 8 terminal hyperlinks — clickable in iTerm2, Kitty, VS Code terminal,
-// modern gnome-terminal. Invisible escape sequences in unsupported terminals,
-// so the URL text still shows and remains copy-pasteable.
-function hyperlink(label: string, url: string): string {
-  return `\x1b]8;;${url}\x1b\\${label}\x1b]8;;\x1b\\`;
-}
-
-function rule(): string {
-  return `${DIM}  ${"─".repeat(62)}${RESET}`;
-}
-
-// Word-wrap at `width` chars. Needed for readme previews and narrow terminals.
-function wrapText(text: string, width: number): string[] {
-  const words = text.split(" ");
-  const lines: string[] = [];
-  let current = "";
-
-  for (const word of words) {
-    const wouldFit = current.length + (current ? 1 : 0) + word.length <= width;
-    if (current && !wouldFit) {
-      lines.push(current);
-      current = word;
-    } else {
-      current = current ? `${current} ${word}` : word;
-    }
-  }
-  if (current) lines.push(current);
-  return lines;
-}
-
-// =============================================================================
-// Installed package detection
-// =============================================================================
-
-// Runs `pi list` and returns the set of installed package names.
-// Any failure (pi not found, non-zero exit, unparseable output) returns an
-// empty set — installed markers are non-critical and should never block startup.
-function getInstalledPackages(): Set<string> {
-  try {
-    const result = spawnSync("pi", ["list"], { encoding: "utf8", timeout: 5_000 });
-    if (result.status !== 0 || !result.stdout) return new Set();
-    // `pi list` is assumed to print one package name per line.
-    return new Set(
-      result.stdout.split("\n").map((l) => l.trim()).filter(Boolean)
-    );
-  } catch {
-    return new Set();
-  }
-}
-
-// =============================================================================
-// npm registry API
-// =============================================================================
-
-const PAGE_SIZE  = 20;
+const PAGE_SIZE  = 15;
 const NPM_SEARCH = "https://registry.npmjs.org/-/v1/search";
-const NPM_PKG    = "https://registry.npmjs.org"; // /<name> for full doc + readme
+const NPM_PKG    = "https://registry.npmjs.org";
 const NPM_DL     = "https://api.npmjs.org/downloads/point/last-month";
 
-// Formats a raw download count as a compact human-readable string.
 function formatDownloads(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M/mo`;
   if (n >= 1_000)     return `${(n / 1_000).toFixed(1)}k/mo`;
   return `${n}/mo`;
 }
 
-// Fetches last-month download counts for a list of package names from the
-// npm downloads API. All requests run in parallel; individual failures are
-// silently ignored so a single bad package never breaks the whole page.
 async function fetchDownloads(names: string[]): Promise<Map<string, number>> {
   const counts = new Map<string, number>();
-
-  await Promise.all(
-    names.map(async (name) => {
-      try {
-        // Scoped package names (e.g. @scope/pkg) must be percent-encoded.
-        const res = await fetch(`${NPM_DL}/${encodeURIComponent(name)}`, {
-          signal: AbortSignal.timeout(5_000),
-        });
-        if (!res.ok) return;
-        const data = (await res.json()) as { downloads?: number };
-        if (typeof data.downloads === "number") counts.set(name, data.downloads);
-      } catch {
-        // Non-critical — the catalog still renders without this package's count.
-      }
-    })
-  );
-
+  await Promise.all(names.map(async (name) => {
+    try {
+      const res = await fetch(`${NPM_DL}/${encodeURIComponent(name)}`, { signal: AbortSignal.timeout(5_000) });
+      if (!res.ok) return;
+      const data = (await res.json()) as { downloads?: number };
+      if (typeof data.downloads === "number") counts.set(name, data.downloads);
+    } catch { /* non-critical */ }
+  }));
   return counts;
 }
 
-// Searches npm for packages tagged `keywords:pi-package`, optionally filtered
-// by an extra query string. Results are ordered by popularity (download weight
-// = 1, quality = 0, maintenance = 0), then enriched with exact last-month
-// download counts fetched in parallel from the downloads API.
-async function searchNpm(
-  query: string,
-  page: number
-): Promise<{ packages: Package[]; total: number }> {
+async function searchNpm(query: string, page: number): Promise<{ packages: Package[]; total: number }> {
   const params = new URLSearchParams({
     text:        `keywords:pi-package ${query}`.trim(),
     size:        String(PAGE_SIZE),
@@ -162,382 +67,573 @@ async function searchNpm(
     quality:     "0",
     maintenance: "0",
   });
-
   const res = await fetch(`${NPM_SEARCH}?${params}`, {
     headers: { Accept: "application/json" },
     signal:  AbortSignal.timeout(8_000),
   });
-
   if (!res.ok) throw new Error(`npm search HTTP ${res.status}`);
-
   const data = (await res.json()) as NpmSearchResponse;
-
-  // Build the base package list, then fire off download-count requests for
-  // all names on this page in parallel before we return.
-  const packages: Package[] = data.objects.map((obj, i) => {
-    const repo   = obj.package.links.repository ?? "";
-    const github = repo.includes("github.com") ? repo : undefined;
-
+  const packages: Package[] = data.objects.map((obj) => {
+    const repo = obj.package.links.repository ?? "";
     return {
-      id:          i + 1,
       name:        obj.package.name,
       description: obj.package.description ?? "(no description)",
       npm:         obj.package.links.npm,
-      github,
+      github:      repo.includes("github.com") ? repo : undefined,
     };
   });
-
   const counts = await fetchDownloads(packages.map((p) => p.name));
-  for (const pkg of packages) {
-    pkg.downloads = counts.get(pkg.name);
-  }
-
+  for (const pkg of packages) pkg.downloads = counts.get(pkg.name);
   return { packages, total: data.total };
 }
 
-// Fetches the readme for a single package from the full npm package document.
-// This is intentionally lazy — only called when the user opens a detail pane —
-// to avoid hammering the registry on every page load.
-// Returns null if the fetch fails or the package has no readme.
-async function fetchReadme(packageName: string): Promise<string | null> {
+async function fetchReadme(name: string): Promise<string | null> {
   try {
-    const res = await fetch(`${NPM_PKG}/${encodeURIComponent(packageName)}`, {
+    const res = await fetch(`${NPM_PKG}/${encodeURIComponent(name)}`, {
       headers: { Accept: "application/json" },
       signal:  AbortSignal.timeout(8_000),
     });
     if (!res.ok) return null;
     const data = (await res.json()) as { readme?: string };
     return data.readme ?? null;
-  } catch {
-    return null;
-  }
+  } catch { return null; }
+}
+
+function stripMarkdown(text: string): string {
+  return text
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/```[\s\S]*?```/gm, "[code]")
+    .replace(/`[^`]+`/g, (m) => m.slice(1, -1))
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 // =============================================================================
-// Catalog page view
+// Settings / installed packages
 // =============================================================================
 
-function renderPage(
-  packages: Package[],
-  page: number,
-  totalPages: number,
-  total: number,
-  query: string,
-  installed: Set<string>
-): string {
-  const queryTag = query
-    ? `  ${YELLOW}· "${query}"${RESET}  ${DIM}(type / to clear)${RESET}`
-    : "";
-  const pageTag = `${DIM}${total.toLocaleString()} packages · page ${page}/${totalPages}${RESET}`;
+const SETTINGS_PATH = join(homedir(), ".pi", "agent", "settings.json");
 
-  const lines: string[] = [
-    "",
-    `${BOLD}${CYAN}  Pi Extensions${RESET}   ${pageTag}${queryTag}`,
-    rule(),
-    "",
-  ];
+function readSettings(): Record<string, unknown> {
+  try { return JSON.parse(readFileSync(SETTINGS_PATH, "utf8")); } catch { return {}; }
+}
 
-  for (const pkg of packages) {
-    const isInstalled = installed.has(pkg.name);
-    const checkmark   = isInstalled ? `${GREEN}✓ ${RESET}` : `  `;
-    const dlTag       = pkg.downloads !== undefined
-      ? `  ${DIM}${formatDownloads(pkg.downloads)}${RESET}`
-      : "";
+function writeSettings(settings: Record<string, unknown>): void {
+  writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2));
+}
 
-    lines.push(`  ${checkmark}${BOLD}${pkg.id}${RESET}  ${GREEN}${pkg.name}${RESET}${dlTag}`);
-    lines.push(`         ${DIM}${pkg.description}${RESET}`);
+/** Strip npm: prefix + trailing @version, preserving @scope prefix. */
+function stripPkgEntry(raw: string): string {
+  const name = raw.trim().replace(/^npm:/, "");
+  if (name.startsWith("@")) {
+    // @scope/pkg or @scope/pkg@1.2.3 — version starts after the slash part
+    const slash = name.indexOf("/");
+    if (slash === -1) return name;
+    const afterSlash = name.slice(slash + 1);
+    const ver = afterSlash.indexOf("@");
+    return ver === -1 ? name : name.slice(0, slash + 1 + ver);
   }
+  // plain pkg or pkg@1.2.3
+  const ver = name.indexOf("@");
+  return ver === -1 ? name : name.slice(0, ver);
+}
 
-  lines.push("");
-  lines.push(rule());
-  lines.push(
-    `${DIM}  n·p=page   ?<n>=preview   1,3,5=install   /<terms>=search   /=reset   ↵=exit${RESET}`
+/** Returns package names registered in settings.json. */
+function getSettingsPackages(): string[] {
+  const settings = readSettings();
+  const pkgs = Array.isArray(settings.packages) ? (settings.packages as string[]) : [];
+  return pkgs
+    .filter((p) => typeof p === "string" && p.startsWith("npm:"))
+    .map(stripPkgEntry)
+    .filter(Boolean);
+}
+
+/** Returns set of globally npm-installed pi packages (from pi list). */
+function getInstalledPackages(): Set<string> {
+  try {
+    const result = spawnSync("pi", ["list"], { encoding: "utf8", timeout: 5_000 });
+    if (result.status !== 0 || !result.stdout) return new Set();
+    return new Set(
+      result.stdout.split("\n").map(stripPkgEntry).filter(Boolean)
+    );
+  } catch { return new Set(); }
+}
+
+function addToSettings(name: string): void {
+  const settings = readSettings();
+  const packages = Array.isArray(settings.packages) ? (settings.packages as string[]) : [];
+  const entry = `npm:${name}`;
+  if (!packages.includes(entry)) {
+    packages.push(entry);
+    settings.packages = packages;
+    writeSettings(settings);
+  }
+}
+
+function removeFromSettings(name: string): void {
+  const settings = readSettings();
+  const packages = Array.isArray(settings.packages) ? (settings.packages as string[]) : [];
+  settings.packages = packages.filter(
+    (p) => p !== `npm:${name}` && p !== name
   );
-  lines.push("");
-
-  return lines.join("\n");
+  writeSettings(settings);
 }
 
 // =============================================================================
-// Detail pane  (readme fetched on demand)
+// Install / uninstall
 // =============================================================================
 
-async function showDetail(
-  pkg: Package,
-  notify: (msg: string) => void,
-  installed: Set<string>
-): Promise<void> {
-  notify(`${DIM}  Fetching readme…${RESET}`);
+async function installPackages(
+  pi: ExtensionAPI,
+  names: string[],
+  onLine: (line: string) => void
+): Promise<Map<string, boolean>> {
+  const results        = new Map<string, boolean>();
+  const alreadyInstalled = getInstalledPackages();
 
-  const raw = await fetchReadme(pkg.name);
+  for (const name of names) {
+    if (alreadyInstalled.has(name)) {
+      onLine(`${name} already installed — registering in settings`);
+      addToSettings(name);
+      results.set(name, true);
+      continue;
+    }
+    onLine(`Installing ${name}…`);
+    try {
+      const result = await pi.exec("npm", ["install", "-g", name], { timeout: 120_000 });
+      if (result.stdout) result.stdout.split("\n").filter(Boolean).forEach(onLine);
+      if (result.stderr) result.stderr.split("\n").filter(Boolean).forEach(onLine);
+      const ok = result.code === 0;
+      if (ok) addToSettings(name);
+      results.set(name, ok);
+    } catch (e: unknown) {
+      onLine(`Error: ${e instanceof Error ? e.message : String(e)}`);
+      results.set(name, false);
+    }
+  }
+  return results;
+}
 
-  // Strip the most common markdown syntax for a readable plain-text preview.
-  // We don't need a full markdown parser here — stripping headers, fences,
-  // and inline links is enough to make the first ~600 chars usable.
-  const readme = raw
-    ? raw
-        .replace(/^#{1,6}\s+/gm, "")             // ## headers
-        .replace(/```[\s\S]*?```/gm, "[code]")   // fenced code blocks
-        .replace(/`[^`]+`/g, (m) => m.slice(1, -1)) // inline code
-        .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1") // [label](url) → label
-        .replace(/\n{3,}/g, "\n\n")              // collapse blank lines
-        .trim()
-        .slice(0, 600)
-    : "(no readme available)";
+async function uninstallPackages(
+  pi: ExtensionAPI,
+  names: string[],
+  onLine: (line: string) => void
+): Promise<Map<string, boolean>> {
+  const results = new Map<string, boolean>();
 
-  const truncated = raw && raw.length > 600;
+  for (const name of names) {
+    onLine(`Uninstalling ${name}…`);
+    try {
+      const result = await pi.exec("npm", ["uninstall", "-g", name], { timeout: 60_000 });
+      if (result.stdout) result.stdout.split("\n").filter(Boolean).forEach(onLine);
+      if (result.stderr) result.stderr.split("\n").filter(Boolean).forEach(onLine);
+      const ok = result.code === 0;
+      if (ok) removeFromSettings(name);
+      results.set(name, ok);
+    } catch (e: unknown) {
+      onLine(`Error: ${e instanceof Error ? e.message : String(e)}`);
+      results.set(name, false);
+    }
+  }
+  return results;
+}
 
-  const dlTag          = pkg.downloads !== undefined
-    ? `  ${DIM}${formatDownloads(pkg.downloads)}${RESET}`
-    : "";
-  const installedBadge = installed.has(pkg.name)
-    ? `  ${GREEN}✓ installed${RESET}`
-    : "";
+// =============================================================================
+// Browser component
+// =============================================================================
 
-  const lines: string[] = [
-    "",
-    rule(),
-    `  ${BOLD}${GREEN}${pkg.name}${RESET}${dlTag}${installedBadge}`,
-    "",
-    ...wrapText(readme, 60).map((line) => `  ${line}`),
-  ];
+type ViewMode = "browse" | "manage";
 
-  if (truncated) lines.push(`  ${DIM}… (truncated — full readme on npm)${RESET}`);
-  lines.push("");
+interface BrowserResult {
+  action: "install" | "uninstall";
+  selected: string[];
+}
 
-  if (pkg.npm || pkg.github) {
-    lines.push(`  ${BOLD}Links${RESET}`);
-    if (pkg.npm)    lines.push(`    npm     ${CYAN}${hyperlink(pkg.npm, pkg.npm)}${RESET}`);
-    if (pkg.github) lines.push(`    GitHub  ${CYAN}${hyperlink(pkg.github, pkg.github)}${RESET}`);
-    lines.push("");
+function createBrowserComponent(
+  tui: { requestRender: () => void },
+  theme: { fg: (color: string, text: string) => string; bold: (text: string) => string; bg: (color: string, text: string) => string },
+  done: (result: BrowserResult | null) => void
+) {
+  // ── Browse state ──────────────────────────────────────────────────────────
+  let viewMode: ViewMode  = "browse";
+  let packages: Package[] = [];
+  let total               = 0;
+  let totalPages          = 1;
+  let page                = 1;
+  let browseCursor        = 0;
+  let query               = "";
+  let searchMode          = false;
+  let searchBuffer        = "";
+  let loading             = false;
+  let error               = "";
+  let previewPkg: Package | null = null;
+  let previewText         = "";
+  const browseSelected    = new Set<string>();
+
+  // ── Manage state ──────────────────────────────────────────────────────────
+  let managePkgs: string[]  = [];
+  let manageCursor          = 0;
+  const manageSelected      = new Set<string>();
+
+  // ── Shared ────────────────────────────────────────────────────────────────
+  const installed = getInstalledPackages();
+  let cachedLines: string[] | undefined;
+
+  function invalidate() { cachedLines = undefined; }
+  function refresh()    { invalidate(); tui.requestRender(); }
+
+  // ── Load helpers ──────────────────────────────────────────────────────────
+
+  async function loadPage() {
+    loading = true; error = ""; refresh();
+    try {
+      const result = await searchNpm(query, page);
+      packages   = result.packages;
+      total      = result.total;
+      totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+      browseCursor = 0;
+      previewPkg   = null;
+    } catch (e: unknown) {
+      error = e instanceof Error ? e.message : String(e);
+    } finally {
+      loading = false; refresh();
+    }
   }
 
-  lines.push(`  ${BOLD}Install${RESET}`);
-  lines.push(`    ${DIM}pi install ${pkg.name}${RESET}`);
-  lines.push("");
-  lines.push(rule());
-  lines.push("");
-
-  notify(lines.join("\n"));
-}
-
-// =============================================================================
-// Selection parsing
-// =============================================================================
-
-// IDs are relative to the current page, so we resolve against `currentPage`.
-function parseSelection(input: string, currentPage: Package[]): Package[] {
-  const ids = input
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .map(Number)
-    .filter((n) => Number.isInteger(n));
-
-  const seen     = new Set<number>();
-  const selected: Package[] = [];
-
-  for (const id of ids) {
-    if (seen.has(id)) continue;
-    seen.add(id);
-    const pkg = currentPage.find((p) => p.id === id);
-    if (pkg) selected.push(pkg);
+  function loadManage() {
+    managePkgs   = getSettingsPackages();
+    manageCursor = 0;
+    manageSelected.clear();
+    refresh();
   }
 
-  return selected;
-}
+  async function loadPreview(pkg: Package) {
+    previewPkg  = pkg;
+    previewText = "Loading readme…";
+    refresh();
+    const raw   = await fetchReadme(pkg.name);
+    previewText = raw ? stripMarkdown(raw).slice(0, 800) : "(no readme available)";
+    refresh();
+  }
 
-// =============================================================================
-// Installation
-// =============================================================================
+  // Initial load
+  loadPage();
 
-async function installPackage(
-  pkg: Package,
-  notify: (msg: string) => void
-): Promise<boolean> {
-  notify(`${BOLD}Installing${RESET} ${GREEN}${pkg.name}${RESET} …`);
+  // ── Input ─────────────────────────────────────────────────────────────────
 
-  return new Promise<boolean>((resolve) => {
-    const child = spawn("pi", ["install", pkg.name], {
-      stdio: ["ignore", "pipe", "pipe"],
-      shell: false,
-    });
+  function handleInput(data: string) {
+    // ── Manage view ────────────────────────────────────────────────────────
+    if (viewMode === "manage") {
+      if (matchesKey(data, Key.escape) || data === "u") {
+        viewMode = "browse";
+        refresh();
+        return;
+      }
+      if (matchesKey(data, Key.up)) {
+        manageCursor = Math.max(0, manageCursor - 1);
+        refresh();
+        return;
+      }
+      if (matchesKey(data, Key.down)) {
+        manageCursor = Math.min(managePkgs.length - 1, manageCursor + 1);
+        refresh();
+        return;
+      }
+      if (data === " ") {
+        const name = managePkgs[manageCursor];
+        if (!name) return;
+        if (manageSelected.has(name)) manageSelected.delete(name);
+        else manageSelected.add(name);
+        refresh();
+        return;
+      }
+      if (matchesKey(data, Key.enter)) {
+        if (manageSelected.size === 0) {
+          // Select item under cursor
+          const name = managePkgs[manageCursor];
+          if (name) manageSelected.add(name);
+        }
+        done({ action: "uninstall", selected: [...manageSelected] });
+        return;
+      }
+      return;
+    }
 
-    child.stdout.on("data", (chunk: Buffer) =>
-      chunk.toString().split("\n").filter(Boolean).forEach((l) =>
-        notify(`  ${DIM}${l}${RESET}`)
-      )
-    );
+    // ── Search mode ────────────────────────────────────────────────────────
+    if (searchMode) {
+      if (matchesKey(data, Key.escape)) {
+        searchMode   = false;
+        searchBuffer = query;
+        refresh();
+        return;
+      }
+      if (matchesKey(data, Key.enter)) {
+        query      = searchBuffer.trim();
+        searchMode = false;
+        page       = 1;
+        loadPage();
+        return;
+      }
+      if (matchesKey(data, Key.backspace)) {
+        searchBuffer = searchBuffer.slice(0, -1);
+        refresh();
+        return;
+      }
+      if (data.length === 1 && data >= " ") {
+        searchBuffer += data;
+        refresh();
+        return;
+      }
+      return;
+    }
 
-    // pi install writes progress to stderr, so show it rather than suppress it.
-    child.stderr.on("data", (chunk: Buffer) =>
-      chunk.toString().split("\n").filter(Boolean).forEach((l) =>
-        notify(`  ${RED}${l}${RESET}`)
-      )
-    );
+    // ── Preview mode ───────────────────────────────────────────────────────
+    if (previewPkg) {
+      previewPkg = null;
+      refresh();
+      return;
+    }
 
-    child.on("close", (code) => resolve(code === 0));
-    child.on("error", (err) => {
-      notify(`  ${RED}Could not spawn pi: ${err.message}${RESET}`);
-      resolve(false);
-    });
-  });
+    // ── Browse mode ────────────────────────────────────────────────────────
+    if (matchesKey(data, Key.escape)) { done(null); return; }
+
+    if (matchesKey(data, Key.up)) {
+      browseCursor = Math.max(0, browseCursor - 1);
+      refresh();
+      return;
+    }
+    if (matchesKey(data, Key.down)) {
+      browseCursor = Math.min(packages.length - 1, browseCursor + 1);
+      refresh();
+      return;
+    }
+    if (matchesKey(data, Key.right) || data === "n") {
+      if (page < totalPages) { page++; loadPage(); }
+      return;
+    }
+    if (matchesKey(data, Key.left) || data === "p") {
+      if (page > 1) { page--; loadPage(); }
+      return;
+    }
+    if (data === " ") {
+      const pkg = packages[browseCursor];
+      if (!pkg) return;
+      if (browseSelected.has(pkg.name)) browseSelected.delete(pkg.name);
+      else browseSelected.add(pkg.name);
+      refresh();
+      return;
+    }
+    if (matchesKey(data, Key.enter)) {
+      const pkg = packages[browseCursor];
+      if (pkg) loadPreview(pkg);
+      return;
+    }
+    if (data === "i" || data === "I") {
+      if (browseSelected.size === 0) {
+        const pkg = packages[browseCursor];
+        if (pkg) browseSelected.add(pkg.name);
+      }
+      done({ action: "install", selected: [...browseSelected] });
+      return;
+    }
+    if (data === "/") {
+      searchMode   = true;
+      searchBuffer = query;
+      refresh();
+      return;
+    }
+    if (data === "u" || data === "U") {
+      viewMode = "manage";
+      loadManage();
+      return;
+    }
+  }
+
+  // ── Render ────────────────────────────────────────────────────────────────
+
+  function render(width: number): string[] {
+    if (cachedLines) return cachedLines;
+    const lines: string[] = [];
+    const add = (s: string) => lines.push(truncateToWidth(s, width));
+    const sep = theme.fg("dim", "─".repeat(width));
+
+    if (viewMode === "manage") {
+      renderManage(lines, add, sep, width);
+    } else {
+      renderBrowse(lines, add, sep, width);
+    }
+
+    cachedLines = lines;
+    return lines;
+  }
+
+  function renderBrowse(
+    lines: string[],
+    add: (s: string) => void,
+    sep: string,
+    _width: number
+  ) {
+    add(sep);
+    const headerRight = loading
+      ? theme.fg("dim", " Loading…")
+      : error
+      ? theme.fg("error", ` Error: ${error}`)
+      : theme.fg("dim", ` ${total.toLocaleString()} pkgs · page ${page}/${totalPages}`);
+    add(`${theme.bold(theme.fg("accent", " Pi Extensions"))}${headerRight}   ${theme.fg("dim", "[u]=uninstall packages")}`);
+    if (query) add(theme.fg("dim", ` search: `) + theme.fg("warning", query));
+    add(sep);
+
+    if (searchMode) {
+      add(theme.fg("accent", " /") + searchBuffer + theme.fg("dim", "█"));
+      add(theme.fg("dim", " Enter=confirm  Esc=cancel"));
+      add(sep);
+      return;
+    }
+
+    if (previewPkg) {
+      const pkg = previewPkg;
+      add(theme.bold(theme.fg("success", ` ${pkg.name}`)) +
+        (pkg.downloads !== undefined ? theme.fg("dim", `  ${formatDownloads(pkg.downloads)}`) : "") +
+        (installed.has(pkg.name) ? theme.fg("success", "  ✓ installed") : ""));
+      add(theme.fg("muted", ` ${pkg.description}`));
+      lines.push("");
+      const textLines = previewText.split("\n");
+      for (const l of textLines.slice(0, 20)) add(` ${l}`);
+      if (textLines.length > 20) add(theme.fg("dim", ` … (${textLines.length - 20} more lines)`));
+      lines.push("");
+      if (pkg.npm)    add(theme.fg("dim", " npm:    ") + theme.fg("accent", pkg.npm));
+      if (pkg.github) add(theme.fg("dim", " github: ") + theme.fg("accent", pkg.github));
+      add(sep);
+      add(theme.fg("dim", " Any key to close preview"));
+      add(sep);
+      return;
+    }
+
+    if (loading) {
+      add(theme.fg("dim", " Loading…"));
+    } else if (packages.length === 0) {
+      add(theme.fg("dim", " No packages found"));
+    } else {
+      for (let i = 0; i < packages.length; i++) {
+        const pkg      = packages[i];
+        const isCursor = i === browseCursor;
+        const isSel    = browseSelected.has(pkg.name);
+        const isInst   = installed.has(pkg.name);
+        const dlTag    = pkg.downloads !== undefined ? ` ${formatDownloads(pkg.downloads)}` : "";
+
+        if (isCursor) {
+          add(theme.bg("selectedBg", theme.fg("text",  ` ${isSel ? "●" : isInst ? "✓" : " "} ${pkg.name}${dlTag}`)));
+          add(theme.bg("selectedBg", theme.fg("muted", `   ${pkg.description}`)));
+        } else {
+          const check = isSel ? theme.fg("accent", "●") : isInst ? theme.fg("success", "✓") : " ";
+          const name  = theme.fg(isSel ? "accent" : isInst ? "success" : "text", pkg.name);
+          add(` ${check} ${name}${theme.fg("dim", dlTag)}`);
+          add(theme.fg("muted", `   ${pkg.description}`));
+        }
+      }
+    }
+
+    add(sep);
+    if (browseSelected.size > 0) {
+      add(theme.fg("accent", ` ${browseSelected.size} selected: `) + theme.fg("dim", [...browseSelected].join(", ")));
+    }
+    add(` ${["↑↓=move","Space=select","Enter=preview","←→/n·p=page","i=install","/=search","u=uninstall packages","Esc=exit"].map((h) => theme.fg("dim", h)).join(theme.fg("dim", "  "))}`);
+    add(sep);
+  }
+
+  function renderManage(
+    lines: string[],
+    add: (s: string) => void,
+    sep: string,
+    _width: number
+  ) {
+    add(sep);
+    add(`${theme.bold(theme.fg("warning", " Manage Installed"))}   ${theme.fg("dim", `${managePkgs.length} packages`)}`);
+    add(sep);
+
+    if (managePkgs.length === 0) {
+      add(theme.fg("dim", " No packages installed"));
+    } else {
+      for (let i = 0; i < managePkgs.length; i++) {
+        const name     = managePkgs[i];
+        const isCursor = i === manageCursor;
+        const isSel    = manageSelected.has(name);
+
+        if (isCursor) {
+          add(theme.bg("selectedBg", theme.fg("text",  ` ${isSel ? "●" : "○"} ${name}`)));
+        } else {
+          const mark = isSel ? theme.fg("error", "●") : theme.fg("dim", "○");
+          add(` ${mark} ${theme.fg("text", name)}`);
+        }
+      }
+    }
+
+    add(sep);
+    if (manageSelected.size > 0) {
+      add(theme.fg("error", ` ${manageSelected.size} to remove: `) + theme.fg("dim", [...manageSelected].join(", ")));
+    }
+    add(` ${["↑↓=move","Space=select","Enter=uninstall","u·Esc=back"].map((h) => theme.fg("dim", h)).join(theme.fg("dim", "  "))}`);
+    add(sep);
+  }
+
+  return { render, invalidate, handleInput };
 }
 
 // =============================================================================
 // Command handler
 // =============================================================================
 
-async function extensionsCommand(ctx: PiContext): Promise<void> {
-  // Mutable browsing state — updated by loadPage() and user commands.
-  let page        = 1;
-  let query       = "";
-  let currentPage: Package[] = [];
-  let totalPages  = 1;
-  let total       = 0;
+type PiCtx = {
+  hasUI: boolean;
+  ui: {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    custom: <T>(cb: (...args: any[]) => any) => Promise<T | null>;
+    notify: (msg: string, level: string) => void;
+    confirm: (title: string, msg: string) => Promise<boolean>;
+  };
+};
 
-  // Resolved once at startup; updated after each successful install so the
-  // ✓ markers stay accurate within the same session.
-  const installed = getInstalledPackages();
-
-  // Fetches the current (page, query) combination from npm, updates state,
-  // and re-renders the catalog. Returns false on network failure.
-  async function loadPage(): Promise<boolean> {
-    ctx.notify(`${DIM}  Loading…${RESET}`);
-    try {
-      const result = await searchNpm(query, page);
-      currentPage  = result.packages;
-      total        = result.total;
-      totalPages   = Math.max(1, Math.ceil(total / PAGE_SIZE));
-      ctx.notify(renderPage(currentPage, page, totalPages, total, query, installed));
-      return true;
-    } catch {
-      ctx.notify(`${RED}  Network error — could not reach npm.${RESET}`);
-      return false;
-    }
-  }
-
-  // ── Initial load ───────────────────────────────────────────────────────────
-  ctx.notify(`${DIM}  Fetching packages from npm…${RESET}`);
-  const online = await loadPage();
-  if (!online) return; // loadPage already printed the error
-
-  // ── Browse loop ────────────────────────────────────────────────────────────
-  // Stays open until the user enters a valid selection list (1,3,5) or blanks.
-  // Navigation and preview commands loop back without breaking out.
-  let selected: Package[] = [];
-
-  while (true) {
-    const raw     = await ctx.ui.input("→");
-    const trimmed = raw.trim();
-
-    // blank → exit
-    if (!trimmed) {
-      ctx.notify(`${DIM}Exiting.${RESET}`);
-      return;
-    }
-
-    // n → next page
-    if (trimmed === "n") {
-      if (page >= totalPages) {
-        ctx.notify(`${YELLOW}  Already on the last page.${RESET}`);
-        continue;
-      }
-      page++;
-      await loadPage();
-      continue;
-    }
-
-    // p → previous page
-    if (trimmed === "p") {
-      if (page <= 1) {
-        ctx.notify(`${YELLOW}  Already on the first page.${RESET}`);
-        continue;
-      }
-      page--;
-      await loadPage();
-      continue;
-    }
-
-    // /<terms> → filter search, reset to page 1.
-    // / alone → clear the active filter and return to the full list.
-    if (trimmed.startsWith("/")) {
-      const newQuery = trimmed.slice(1).trim();
-      if (!newQuery && !query) {
-        ctx.notify(`${DIM}  No active search to clear.${RESET}`);
-        continue;
-      }
-      query = newQuery;
-      page  = 1;
-      if (!query) ctx.notify(`${DIM}  Search cleared.${RESET}`);
-      await loadPage();
-      continue;
-    }
-
-    // ?<n> → open detail pane for item n on the current page, then loop back
-    const previewMatch = trimmed.match(/^\?(\d+)$/);
-    if (previewMatch) {
-      const id  = parseInt(previewMatch[1], 10);
-      const pkg = currentPage.find((p) => p.id === id);
-      if (pkg) {
-        await showDetail(pkg, ctx.notify.bind(ctx), installed);
-      } else {
-        ctx.notify(`${RED}  No item ${id} on this page.${RESET}`);
-      }
-      continue;
-    }
-
-    // 1,3,5 → parse as a selection list and break out of the browse loop
-    selected = parseSelection(trimmed, currentPage);
-    if (selected.length === 0) {
-      ctx.notify(
-        `${RED}  Unknown input. Use n/p (pages), ?3 (preview), 1,3,5 (install), /doom (search).${RESET}`
-      );
-      continue;
-    }
-
-    break;
-  }
-
-  // ── Confirm ────────────────────────────────────────────────────────────────
-  const summary = selected.map((p) => `  • ${GREEN}${p.name}${RESET}`).join("\n");
-  ctx.notify(`\n${BOLD}You selected:${RESET}\n${summary}\n`);
-
-  const confirmed = await ctx.ui.confirm("Proceed with installation?");
-  if (!confirmed) {
-    ctx.notify(`${DIM}Installation cancelled.${RESET}`);
+async function runExtensionsCommand(pi: ExtensionAPI, ctx: PiCtx): Promise<void> {
+  if (!ctx.hasUI) {
+    ctx.ui.notify("Extensions browser requires interactive mode.", "error");
     return;
   }
 
-  // ── Install ────────────────────────────────────────────────────────────────
-  const results: Array<{ pkg: Package; ok: boolean }> = [];
+  const result = await ctx.ui.custom<BrowserResult | null>(
+    (tui: { requestRender: () => void }, theme: { fg: (c: string, t: string) => string; bold: (t: string) => string; bg: (c: string, t: string) => string }, _kb: unknown, done: (v: BrowserResult | null) => void) =>
+      createBrowserComponent(tui, theme, done)
+  );
 
-  for (const pkg of selected) {
-    const ok = await installPackage(pkg, ctx.notify.bind(ctx));
-    if (ok) installed.add(pkg.name); // keep markers accurate for the rest of the session
-    results.push({ pkg, ok });
+  if (!result) return;
+
+  if (result.action === "install" && result.selected.length > 0) {
+    const confirmed = await ctx.ui.confirm("Install packages?", result.selected.join(", "));
+    if (!confirmed) return;
+
+    ctx.ui.notify(`Installing ${result.selected.length} package(s)…`, "info");
+    const results = await installPackages(pi, result.selected, (l) => ctx.ui.notify(l, "info"));
+    const failed  = [...results.entries()].filter(([, ok]) => !ok).map(([n]) => n);
+    const success = [...results.entries()].filter(([, ok]) =>  ok).map(([n]) => n);
+    if (success.length) ctx.ui.notify(`✓ Installed: ${success.join(", ")}`, "info");
+    if (failed.length)  ctx.ui.notify(`✗ Failed: ${failed.join(", ")}`, "error");
+    if (success.length) ctx.ui.notify("Run /reload to activate newly installed extensions.", "info");
   }
 
-  // ── Report ─────────────────────────────────────────────────────────────────
-  ctx.notify(`\n${BOLD}Results${RESET}`);
-  ctx.notify(`${DIM}  ${"─".repeat(38)}${RESET}`);
+  if (result.action === "uninstall" && result.selected.length > 0) {
+    const confirmed = await ctx.ui.confirm(
+      "Uninstall packages?",
+      `This will remove: ${result.selected.join(", ")}`
+    );
+    if (!confirmed) return;
 
-  for (const { pkg, ok } of results) {
-    const icon   = ok ? `${GREEN}✓${RESET}` : `${RED}✗${RESET}`;
-    const status = ok ? `${GREEN}installed${RESET}` : `${RED}failed${RESET}`;
-    ctx.notify(`  ${icon}  ${pkg.name}  ${DIM}(${status})${RESET}`);
-  }
-
-  ctx.notify("");
-
-  const failures = results.filter((r) => !r.ok);
-  if (failures.length === 0) {
-    ctx.notify(`${GREEN}${BOLD}All packages installed successfully.${RESET}`);
-  } else {
-    ctx.notify(`${YELLOW}${failures.length} package(s) failed. Retry with:${RESET}`);
-    for (const { pkg } of failures) {
-      ctx.notify(`  ${DIM}pi install ${pkg.name}${RESET}`);
-    }
+    ctx.ui.notify(`Uninstalling ${result.selected.length} package(s)…`, "info");
+    const results = await uninstallPackages(pi, result.selected, (l) => ctx.ui.notify(l, "info"));
+    const failed  = [...results.entries()].filter(([, ok]) => !ok).map(([n]) => n);
+    const success = [...results.entries()].filter(([, ok]) =>  ok).map(([n]) => n);
+    if (success.length) ctx.ui.notify(`✓ Removed: ${success.join(", ")}`, "info");
+    if (failed.length)  ctx.ui.notify(`✗ Failed: ${failed.join(", ")}`, "error");
+    if (success.length) ctx.ui.notify("Run /reload to apply changes.", "info");
   }
 }
 
@@ -545,10 +641,11 @@ async function extensionsCommand(ctx: PiContext): Promise<void> {
 // Extension entry point
 // =============================================================================
 
-export default function register(ctx: PiContext): void {
-  ctx.registerCommand(
-    "/extensions",
-    "Browse and install Pi community packages",
-    () => extensionsCommand(ctx)
-  );
+export default function (pi: ExtensionAPI): void {
+  pi.registerCommand("extensions", {
+    description: "Browse and install Pi community packages",
+    handler: async (_args, ctx) => {
+      await runExtensionsCommand(pi, ctx as unknown as PiCtx);
+    },
+  });
 }
