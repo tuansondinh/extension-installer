@@ -1,4 +1,4 @@
-import { spawn } from "child_process";
+import { spawn, spawnSync } from "child_process";
 
 // =============================================================================
 // Types
@@ -83,6 +83,26 @@ function wrapText(text: string, width: number): string[] {
   }
   if (current) lines.push(current);
   return lines;
+}
+
+// =============================================================================
+// Installed package detection
+// =============================================================================
+
+// Runs `pi list` and returns the set of installed package names.
+// Any failure (pi not found, non-zero exit, unparseable output) returns an
+// empty set — installed markers are non-critical and should never block startup.
+function getInstalledPackages(): Set<string> {
+  try {
+    const result = spawnSync("pi", ["list"], { encoding: "utf8", timeout: 5_000 });
+    if (result.status !== 0 || !result.stdout) return new Set();
+    // `pi list` is assumed to print one package name per line.
+    return new Set(
+      result.stdout.split("\n").map((l) => l.trim()).filter(Boolean)
+    );
+  } catch {
+    return new Set();
+  }
 }
 
 // =============================================================================
@@ -202,10 +222,13 @@ function renderPage(
   page: number,
   totalPages: number,
   total: number,
-  query: string
+  query: string,
+  installed: Set<string>
 ): string {
-  const queryTag = query ? `  ${DIM}· filter: "${query}"${RESET}` : "";
-  const pageTag  = `${DIM}${total.toLocaleString()} packages · page ${page}/${totalPages}${RESET}`;
+  const queryTag = query
+    ? `  ${YELLOW}· "${query}"${RESET}  ${DIM}(type / to clear)${RESET}`
+    : "";
+  const pageTag = `${DIM}${total.toLocaleString()} packages · page ${page}/${totalPages}${RESET}`;
 
   const lines: string[] = [
     "",
@@ -215,18 +238,20 @@ function renderPage(
   ];
 
   for (const pkg of packages) {
-    const dlTag = pkg.downloads !== undefined
+    const isInstalled = installed.has(pkg.name);
+    const checkmark   = isInstalled ? `${GREEN}✓ ${RESET}` : `  `;
+    const dlTag       = pkg.downloads !== undefined
       ? `  ${DIM}${formatDownloads(pkg.downloads)}${RESET}`
       : "";
-    lines.push(`    ${BOLD}${pkg.id}${RESET}  ${GREEN}${pkg.name}${RESET}${dlTag}`);
-    lines.push(`       ${DIM}${pkg.description}${RESET}`);
+
+    lines.push(`  ${checkmark}${BOLD}${pkg.id}${RESET}  ${GREEN}${pkg.name}${RESET}${dlTag}`);
+    lines.push(`         ${DIM}${pkg.description}${RESET}`);
   }
 
   lines.push("");
   lines.push(rule());
-  // Keep the hint compact — one line, tab-separated so it reads as a quick ref.
   lines.push(
-    `${DIM}  n·p=page   ?<n>=preview   1,3,5=install   /<terms>=search   ↵=exit${RESET}`
+    `${DIM}  n·p=page   ?<n>=preview   1,3,5=install   /<terms>=search   /=reset   ↵=exit${RESET}`
   );
   lines.push("");
 
@@ -237,7 +262,11 @@ function renderPage(
 // Detail pane  (readme fetched on demand)
 // =============================================================================
 
-async function showDetail(pkg: Package, notify: (msg: string) => void): Promise<void> {
+async function showDetail(
+  pkg: Package,
+  notify: (msg: string) => void,
+  installed: Set<string>
+): Promise<void> {
   notify(`${DIM}  Fetching readme…${RESET}`);
 
   const raw = await fetchReadme(pkg.name);
@@ -258,14 +287,17 @@ async function showDetail(pkg: Package, notify: (msg: string) => void): Promise<
 
   const truncated = raw && raw.length > 600;
 
-  const dlTag = pkg.downloads !== undefined
+  const dlTag          = pkg.downloads !== undefined
     ? `  ${DIM}${formatDownloads(pkg.downloads)}${RESET}`
+    : "";
+  const installedBadge = installed.has(pkg.name)
+    ? `  ${GREEN}✓ installed${RESET}`
     : "";
 
   const lines: string[] = [
     "",
     rule(),
-    `  ${BOLD}${GREEN}${pkg.name}${RESET}${dlTag}`,
+    `  ${BOLD}${GREEN}${pkg.name}${RESET}${dlTag}${installedBadge}`,
     "",
     ...wrapText(readme, 60).map((line) => `  ${line}`),
   ];
@@ -358,11 +390,15 @@ async function installPackage(
 
 async function extensionsCommand(ctx: PiContext): Promise<void> {
   // Mutable browsing state — updated by loadPage() and user commands.
-  let page           = 1;
-  let query          = "";
-  let currentPage:     Package[] = [];
-  let totalPages     = 1;
-  let total          = 0;
+  let page        = 1;
+  let query       = "";
+  let currentPage: Package[] = [];
+  let totalPages  = 1;
+  let total       = 0;
+
+  // Resolved once at startup; updated after each successful install so the
+  // ✓ markers stay accurate within the same session.
+  const installed = getInstalledPackages();
 
   // Fetches the current (page, query) combination from npm, updates state,
   // and re-renders the catalog. Returns false on network failure.
@@ -373,7 +409,7 @@ async function extensionsCommand(ctx: PiContext): Promise<void> {
       currentPage  = result.packages;
       total        = result.total;
       totalPages   = Math.max(1, Math.ceil(total / PAGE_SIZE));
-      ctx.notify(renderPage(currentPage, page, totalPages, total, query));
+      ctx.notify(renderPage(currentPage, page, totalPages, total, query, installed));
       return true;
     } catch {
       ctx.notify(`${RED}  Network error — could not reach npm.${RESET}`);
@@ -423,10 +459,17 @@ async function extensionsCommand(ctx: PiContext): Promise<void> {
       continue;
     }
 
-    // /<terms> → filter search, reset to page 1
+    // /<terms> → filter search, reset to page 1.
+    // / alone → clear the active filter and return to the full list.
     if (trimmed.startsWith("/")) {
-      query = trimmed.slice(1).trim();
+      const newQuery = trimmed.slice(1).trim();
+      if (!newQuery && !query) {
+        ctx.notify(`${DIM}  No active search to clear.${RESET}`);
+        continue;
+      }
+      query = newQuery;
       page  = 1;
+      if (!query) ctx.notify(`${DIM}  Search cleared.${RESET}`);
       await loadPage();
       continue;
     }
@@ -437,7 +480,7 @@ async function extensionsCommand(ctx: PiContext): Promise<void> {
       const id  = parseInt(previewMatch[1], 10);
       const pkg = currentPage.find((p) => p.id === id);
       if (pkg) {
-        await showDetail(pkg, ctx.notify.bind(ctx));
+        await showDetail(pkg, ctx.notify.bind(ctx), installed);
       } else {
         ctx.notify(`${RED}  No item ${id} on this page.${RESET}`);
       }
@@ -471,6 +514,7 @@ async function extensionsCommand(ctx: PiContext): Promise<void> {
 
   for (const pkg of selected) {
     const ok = await installPackage(pkg, ctx.notify.bind(ctx));
+    if (ok) installed.add(pkg.name); // keep markers accurate for the rest of the session
     results.push({ pkg, ok });
   }
 
