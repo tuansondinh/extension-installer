@@ -15,15 +15,31 @@ interface PiContext {
   registerCommand(name: string, description: string, handler: () => Promise<void>): void;
 }
 
-// A package in the curated catalog.
+// A package entry as used throughout the UI. IDs are 1-based within the
+// current page, so they reset on every page/search change.
 interface Package {
   id: number;
-  name: string;        // exact string passed to `pi install`
-  category: string;
-  description: string; // one-liner shown in the catalog list
-  readme: string;      // paragraph shown in the detail pane
-  npm?: string;        // npmjs.com URL — present for @scope/pkg packages
-  github?: string;     // GitHub repo URL — present for git: packages (derived from name)
+  name: string;
+  description: string;
+  npm?: string;    // npmjs.com URL
+  github?: string; // GitHub repo URL
+}
+
+// Partial shape of the npm registry search response we care about.
+interface NpmSearchObject {
+  package: {
+    name: string;
+    description?: string;
+    links: {
+      npm?: string;
+      repository?: string;
+    };
+  };
+}
+
+interface NpmSearchResponse {
+  total: number;
+  objects: NpmSearchObject[];
 }
 
 // =============================================================================
@@ -38,24 +54,18 @@ const YELLOW = "\x1b[33m";
 const GREEN  = "\x1b[32m";
 const RED    = "\x1b[31m";
 
-// OSC 8 is the de-facto standard for terminal hyperlinks (RFC-like).
-// Supported by iTerm2, Kitty, VS Code integrated terminal, modern gnome-terminal.
-// In unsupported terminals the escape sequences are invisible, so it degrades
-// gracefully to plain text — the URL is still visible right below.
-// Format:  ESC ] 8 ; <params> ; <uri>  ST  <label>  ESC ] 8 ; ;  ST
-// where ST (String Terminator) is ESC followed by backslash.
+// OSC 8 terminal hyperlinks — clickable in iTerm2, Kitty, VS Code terminal,
+// modern gnome-terminal. Invisible escape sequences in unsupported terminals,
+// so the URL text still shows and remains copy-pasteable.
 function hyperlink(label: string, url: string): string {
   return `\x1b]8;;${url}\x1b\\${label}\x1b]8;;\x1b\\`;
 }
 
-// A horizontal rule sized to fit the catalog layout.
 function rule(): string {
   return `${DIM}  ${"─".repeat(62)}${RESET}`;
 }
 
-// Naive word-wrap at `width` characters. We need this because readme strings
-// are long prose and terminals may be narrow — better to wrap in code than
-// rely on the terminal's own wrapping, which can split mid-word.
+// Word-wrap at `width` chars. Needed for readme previews and narrow terminals.
 function wrapText(text: string, width: number): string[] {
   const words = text.split(" ");
   const lines: string[] = [];
@@ -71,226 +81,235 @@ function wrapText(text: string, width: number): string[] {
     }
   }
   if (current) lines.push(current);
-
   return lines;
 }
 
 // =============================================================================
-// Curated package catalog
+// Curated fallback packages
+// Shown when the npm registry is unreachable. Kept in sync with the npm
+// keyword `pi-package` — update as new notable packages appear.
 // =============================================================================
 
-const PACKAGES: Package[] = [
-
-  // ── Agents ─────────────────────────────────────────────────────────────────
-
+const FALLBACK: Omit<Package, "id">[] = [
   {
-    id: 1,
     name: "@nicopreme/pi-subagents",
-    category: "Agents",
     description: "Delegate tasks to subagents with chains & parallel execution",
-    readme:
-      "Lets you spin up parallel or chained sub-agents from within a Pi session. " +
-      "Define agent chains in YAML or JSON, pass a goal, and the orchestrator " +
-      "breaks it into sub-tasks dispatched to separate Pi instances. Results are " +
-      "merged back and surfaced as a single response.",
     npm: "https://www.npmjs.com/package/@nicopreme/pi-subagents",
   },
-
   {
-    id: 6,
-    name: "git:github.com/ruizrica/agent-pi",
-    category: "Agents",
-    description: "43 extensions — multi-agent orchestration suite",
-    readme:
-      "A mega-bundle of 43 extensions covering multi-agent orchestration: task " +
-      "decomposition, role assignment, result aggregation, and a supervisor agent " +
-      "that monitors sub-agent health and retries failures automatically.",
-    github: "https://github.com/ruizrica/agent-pi",
-  },
-
-  {
-    id: 7,
-    name: "git:github.com/sids/pi-extensions",
-    category: "Agents",
-    description: "plan-md, diff review, subagent delegation",
-    readme:
-      "A focused set of extensions: plan-md saves Pi plans as markdown files for " +
-      "version control, diff-review does stage-aware code review, and delegate " +
-      "forwards sub-tasks to a fresh Pi agent and collects the results.",
-    github: "https://github.com/sids/pi-extensions",
-  },
-
-  // ── Web / Research ──────────────────────────────────────────────────────────
-
-  {
-    id: 2,
     name: "@nicopreme/pi-web",
-    category: "Web/Research",
     description: "Web search, URL fetch, GitHub clone, PDF, YouTube",
-    readme:
-      "Adds web-aware tools: keyword search (returns ranked snippets), full-page " +
-      "fetch (returns cleaned markdown), GitHub repo clone, PDF text extraction, " +
-      "and YouTube transcript retrieval. All results feed directly into Pi's context.",
     npm: "https://www.npmjs.com/package/@nicopreme/pi-web",
   },
-
-  // ── Code Quality ────────────────────────────────────────────────────────────
-
   {
-    id: 3,
     name: "@nicopreme/pi-dev-pipeline",
-    category: "Code Quality",
     description: "TDD, code review, architecture workflows",
-    readme:
-      "Brings structured engineering workflows: test-driven development (write " +
-      "failing test → implement → verify), automated code review with linting " +
-      "and smell detection, and architecture review via dependency graphs and " +
-      "coupling analysis.",
     npm: "https://www.npmjs.com/package/@nicopreme/pi-dev-pipeline",
   },
-
-  // ── Workflow ────────────────────────────────────────────────────────────────
-
   {
-    id: 4,
     name: "@plannotator/pi-extension",
-    category: "Workflow",
     description: "Plan mode with browser UI for review/approval",
-    readme:
-      "Intercepts Pi's plan mode and exposes the plan in a local browser UI. " +
-      "You read and approve — or reject with comments — each step before Pi " +
-      "executes it, giving fine-grained human-in-the-loop control over agentic runs.",
     npm: "https://www.npmjs.com/package/@plannotator/pi-extension",
   },
-
   {
-    id: 5,
     name: "@aliou/pi-extension-dev",
-    category: "Workflow",
     description: "Tools for developing & updating extensions",
-    readme:
-      "A developer toolkit for building Pi extensions. Includes a live-reload " +
-      "watcher, scaffolding command, type-checking helpers, and an in-session " +
-      "tester so you can iterate on extensions without restarting Pi.",
     npm: "https://www.npmjs.com/package/@aliou/pi-extension-dev",
   },
-
-  // ── Fun ─────────────────────────────────────────────────────────────────────
-
   {
-    id: 8,
+    name: "git:github.com/ruizrica/agent-pi",
+    description: "43 extensions — multi-agent orchestration suite",
+    github: "https://github.com/ruizrica/agent-pi",
+  },
+  {
+    name: "git:github.com/sids/pi-extensions",
+    description: "plan-md, diff review, subagent delegation",
+    github: "https://github.com/sids/pi-extensions",
+  },
+  {
     name: "git:github.com/badlogic/pi-doom",
-    category: "Fun",
     description: "Doom. In your terminal. While you wait.",
-    readme:
-      "Runs a WebAssembly port of Doom in your terminal using ASCII art while Pi " +
-      "processes a long-running task. Installs a hook that starts the game when a " +
-      "task begins and stops it on completion. rip and tear.",
     github: "https://github.com/badlogic/pi-doom",
   },
 ];
 
-// Determines the order sections appear in the catalog view.
-const CATEGORY_ORDER = ["Agents", "Web/Research", "Code Quality", "Workflow", "Fun"];
-
 // =============================================================================
-// Catalog view  —  the main list shown on /extensions
+// npm registry API
 // =============================================================================
 
-function renderCatalog(): string {
+const PAGE_SIZE = 20;
+const NPM_SEARCH = "https://registry.npmjs.org/-/v1/search";
+const NPM_PKG    = "https://registry.npmjs.org"; // /<name> for full doc + readme
+
+// Searches npm for packages tagged `keywords:pi-package`, optionally filtered
+// by an extra query string. Results are ordered by popularity (download weight
+// = 1, quality = 0, maintenance = 0) — the closest the search API gets to
+// "most downloaded" without making per-package download-count requests.
+async function searchNpm(
+  query: string,
+  page: number
+): Promise<{ packages: Package[]; total: number }> {
+  const params = new URLSearchParams({
+    text:        `keywords:pi-package ${query}`.trim(),
+    size:        String(PAGE_SIZE),
+    from:        String((page - 1) * PAGE_SIZE),
+    popularity:  "1",
+    quality:     "0",
+    maintenance: "0",
+  });
+
+  const res = await fetch(`${NPM_SEARCH}?${params}`, {
+    headers: { Accept: "application/json" },
+    signal:  AbortSignal.timeout(8_000),
+  });
+
+  if (!res.ok) throw new Error(`npm search HTTP ${res.status}`);
+
+  const data = (await res.json()) as NpmSearchResponse;
+
+  const packages: Package[] = data.objects.map((obj, i) => {
+    const repo   = obj.package.links.repository ?? "";
+    const github = repo.includes("github.com") ? repo : undefined;
+
+    return {
+      id:          i + 1,
+      name:        obj.package.name,
+      description: obj.package.description ?? "(no description)",
+      npm:         obj.package.links.npm,
+      github,
+    };
+  });
+
+  return { packages, total: data.total };
+}
+
+// Fetches the readme for a single package from the full npm package document.
+// This is intentionally lazy — only called when the user opens a detail pane —
+// to avoid hammering the registry on every page load.
+// Returns null if the fetch fails or the package has no readme.
+async function fetchReadme(packageName: string): Promise<string | null> {
+  try {
+    const res = await fetch(`${NPM_PKG}/${encodeURIComponent(packageName)}`, {
+      headers: { Accept: "application/json" },
+      signal:  AbortSignal.timeout(8_000),
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as { readme?: string };
+    return data.readme ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// =============================================================================
+// Catalog page view
+// =============================================================================
+
+function renderPage(
+  packages: Package[],
+  page: number,
+  totalPages: number,
+  total: number,
+  query: string
+): string {
+  const queryTag = query ? `  ${DIM}· filter: "${query}"${RESET}` : "";
+  const pageTag  = `${DIM}${total.toLocaleString()} packages · page ${page}/${totalPages}${RESET}`;
+
   const lines: string[] = [
     "",
-    `${BOLD}${CYAN}  Pi Community Extensions${RESET}`,
+    `${BOLD}${CYAN}  Pi Extensions${RESET}   ${pageTag}${queryTag}`,
     rule(),
+    "",
   ];
 
-  // Group packages by category, preserving catalog order within each group.
-  const byCategory = new Map<string, Package[]>();
-  for (const pkg of PACKAGES) {
-    if (!byCategory.has(pkg.category)) byCategory.set(pkg.category, []);
-    byCategory.get(pkg.category)!.push(pkg);
-  }
-
-  for (const category of CATEGORY_ORDER) {
-    const pkgs = byCategory.get(category);
-    if (!pkgs) continue;
-
-    lines.push("");
-    lines.push(`  ${BOLD}${YELLOW}${category}${RESET}`);
-
-    for (const pkg of pkgs) {
-      lines.push(`    ${BOLD}${pkg.id}${RESET}  ${GREEN}${pkg.name}${RESET}`);
-      lines.push(`       ${DIM}${pkg.description}${RESET}`);
-    }
+  for (const pkg of packages) {
+    lines.push(`    ${BOLD}${pkg.id}${RESET}  ${GREEN}${pkg.name}${RESET}`);
+    lines.push(`       ${DIM}${pkg.description}${RESET}`);
   }
 
   lines.push("");
   lines.push(rule());
-  lines.push(`${DIM}  Preview a package: ?2    Install packages: 1,3,5    Cancel: (blank)${RESET}`);
+  // Keep the hint compact — one line, tab-separated so it reads as a quick ref.
+  lines.push(
+    `${DIM}  n·p=page   ?<n>=preview   1,3,5=install   /<terms>=search   ↵=exit${RESET}`
+  );
   lines.push("");
 
   return lines.join("\n");
 }
 
 // =============================================================================
-// Detail pane  —  shown when the user types ?<n>
+// Detail pane  (readme fetched on demand)
 // =============================================================================
 
-function renderDetail(pkg: Package): string {
+async function showDetail(pkg: Package, notify: (msg: string) => void): Promise<void> {
+  notify(`${DIM}  Fetching readme…${RESET}`);
+
+  const raw = await fetchReadme(pkg.name);
+
+  // Strip the most common markdown syntax for a readable plain-text preview.
+  // We don't need a full markdown parser here — stripping headers, fences,
+  // and inline links is enough to make the first ~600 chars usable.
+  const readme = raw
+    ? raw
+        .replace(/^#{1,6}\s+/gm, "")             // ## headers
+        .replace(/```[\s\S]*?```/gm, "[code]")   // fenced code blocks
+        .replace(/`[^`]+`/g, (m) => m.slice(1, -1)) // inline code
+        .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1") // [label](url) → label
+        .replace(/\n{3,}/g, "\n\n")              // collapse blank lines
+        .trim()
+        .slice(0, 600)
+    : "(no readme available)";
+
+  const truncated = raw && raw.length > 600;
+
   const lines: string[] = [
     "",
     rule(),
-    `  ${BOLD}${GREEN}${pkg.name}${RESET}   ${DIM}[${pkg.category}]${RESET}`,
+    `  ${BOLD}${GREEN}${pkg.name}${RESET}`,
     "",
-    // Wrap the readme to 60 chars so it stays readable in narrow terminals.
-    ...wrapText(pkg.readme, 60).map((line) => `  ${line}`),
-    "",
+    ...wrapText(readme, 60).map((line) => `  ${line}`),
   ];
 
-  // Only render the Links section when we actually have at least one URL.
+  if (truncated) lines.push(`  ${DIM}… (truncated — full readme on npm)${RESET}`);
+  lines.push("");
+
   if (pkg.npm || pkg.github) {
     lines.push(`  ${BOLD}Links${RESET}`);
-    if (pkg.npm) {
-      // The hyperlink() call makes the URL clickable; in terminals that don't
-      // support OSC 8 the URL text is still visible and copy-pasteable.
-      lines.push(`    npm     ${CYAN}${hyperlink(pkg.npm, pkg.npm)}${RESET}`);
-    }
-    if (pkg.github) {
-      lines.push(`    GitHub  ${CYAN}${hyperlink(pkg.github, pkg.github)}${RESET}`);
-    }
+    if (pkg.npm)    lines.push(`    npm     ${CYAN}${hyperlink(pkg.npm, pkg.npm)}${RESET}`);
+    if (pkg.github) lines.push(`    GitHub  ${CYAN}${hyperlink(pkg.github, pkg.github)}${RESET}`);
     lines.push("");
   }
 
-  lines.push(`  ${BOLD}Install command${RESET}`);
+  lines.push(`  ${BOLD}Install${RESET}`);
   lines.push(`    ${DIM}pi install ${pkg.name}${RESET}`);
   lines.push("");
   lines.push(rule());
   lines.push("");
 
-  return lines.join("\n");
+  notify(lines.join("\n"));
 }
 
 // =============================================================================
 // Selection parsing
 // =============================================================================
 
-// Accepts "1,3, 5" style input, deduplicates, ignores unknown ids.
-function parseSelection(input: string): Package[] {
+// IDs are relative to the current page, so we resolve against `currentPage`.
+function parseSelection(input: string, currentPage: Package[]): Package[] {
   const ids = input
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean)
     .map(Number)
-    // Reject NaN and non-integers (e.g. "1.5") — user likely made a typo.
     .filter((n) => Number.isInteger(n));
 
-  const seen = new Set<number>();
+  const seen     = new Set<number>();
   const selected: Package[] = [];
 
   for (const id of ids) {
     if (seen.has(id)) continue;
     seen.add(id);
-    const pkg = PACKAGES.find((p) => p.id === id);
+    const pkg = currentPage.find((p) => p.id === id);
     if (pkg) selected.push(pkg);
   }
 
@@ -301,8 +320,6 @@ function parseSelection(input: string): Package[] {
 // Installation
 // =============================================================================
 
-// Spawns `pi install <name>` and streams its stdout/stderr back via notify.
-// Returns true if the process exited with code 0, false otherwise.
 async function installPackage(
   pkg: Package,
   notify: (msg: string) => void
@@ -315,21 +332,20 @@ async function installPackage(
       shell: false,
     });
 
-    child.stdout.on("data", (chunk: Buffer) => {
-      chunk.toString().split("\n").filter(Boolean).forEach((line) =>
-        notify(`  ${DIM}${line}${RESET}`)
-      );
-    });
+    child.stdout.on("data", (chunk: Buffer) =>
+      chunk.toString().split("\n").filter(Boolean).forEach((l) =>
+        notify(`  ${DIM}${l}${RESET}`)
+      )
+    );
 
-    child.stderr.on("data", (chunk: Buffer) => {
-      // pi install writes progress to stderr, so we show it rather than hide it.
-      chunk.toString().split("\n").filter(Boolean).forEach((line) =>
-        notify(`  ${RED}${line}${RESET}`)
-      );
-    });
+    // pi install writes progress to stderr, so show it rather than suppress it.
+    child.stderr.on("data", (chunk: Buffer) =>
+      chunk.toString().split("\n").filter(Boolean).forEach((l) =>
+        notify(`  ${RED}${l}${RESET}`)
+      )
+    );
 
     child.on("close", (code) => resolve(code === 0));
-
     child.on("error", (err) => {
       notify(`  ${RED}Could not spawn pi: ${err.message}${RESET}`);
       resolve(false);
@@ -342,51 +358,115 @@ async function installPackage(
 // =============================================================================
 
 async function extensionsCommand(ctx: PiContext): Promise<void> {
-  ctx.notify(renderCatalog());
+  // Mutable browsing state — updated by loadPage() and user commands.
+  let page           = 1;
+  let query          = "";
+  let currentPage:     Package[] = [];
+  let totalPages     = 1;
+  let total          = 0;
 
-  // ── Selection loop ──────────────────────────────────────────────────────────
-  // We loop here so the user can open as many detail panes as they like before
-  // committing to an install list. Each iteration either:
-  //   ?<n>   → shows the detail pane for package n, then prompts again
-  //   1,3,5  → parsed as a selection list, breaks out of the loop
-  //   (blank) → cancels and exits
+  // Fetches the current (page, query) combination from npm, updates state,
+  // and re-renders the catalog. Returns false on network failure.
+  async function loadPage(): Promise<boolean> {
+    ctx.notify(`${DIM}  Loading…${RESET}`);
+    try {
+      const result = await searchNpm(query, page);
+      currentPage  = result.packages;
+      total        = result.total;
+      totalPages   = Math.max(1, Math.ceil(total / PAGE_SIZE));
+      ctx.notify(renderPage(currentPage, page, totalPages, total, query));
+      return true;
+    } catch {
+      ctx.notify(`${RED}  Network error — could not reach npm.${RESET}`);
+      return false;
+    }
+  }
 
+  // ── Initial load ───────────────────────────────────────────────────────────
+  ctx.notify(`${DIM}  Fetching packages from npm…${RESET}`);
+  const online = await loadPage();
+
+  // If npm was unreachable on the very first load, fall back to the curated
+  // list so the user still has something useful to work with.
+  if (!online) {
+    ctx.notify(`${YELLOW}  Showing curated offline picks instead.${RESET}`);
+    currentPage = FALLBACK.map((p, i) => ({ ...p, id: i + 1 }));
+    total       = currentPage.length;
+    totalPages  = 1;
+    ctx.notify(renderPage(currentPage, page, totalPages, total, query));
+  }
+
+  // ── Browse loop ────────────────────────────────────────────────────────────
+  // Stays open until the user enters a valid selection list (1,3,5) or blanks.
+  // Navigation and preview commands loop back without breaking out.
   let selected: Package[] = [];
 
   while (true) {
-    const raw = await ctx.ui.input(
-      "Select packages (e.g. 1,3,5) or preview one (e.g. ?2):"
-    );
+    const raw     = await ctx.ui.input("→");
     const trimmed = raw.trim();
 
+    // blank → exit
     if (!trimmed) {
-      ctx.notify(`${DIM}No selection made. Exiting.${RESET}`);
+      ctx.notify(`${DIM}Exiting.${RESET}`);
       return;
     }
 
-    // ?<n> → detail pane, then loop back.
-    const previewMatch = trimmed.match(/^\?(\d+)$/);
-    if (previewMatch) {
-      const id  = parseInt(previewMatch[1], 10);
-      const pkg = PACKAGES.find((p) => p.id === id);
-      ctx.notify(pkg ? renderDetail(pkg) : `${RED}No package with id ${id}.${RESET}\n`);
+    // n → next page
+    if (trimmed === "n") {
+      if (page >= totalPages) {
+        ctx.notify(`${YELLOW}  Already on the last page.${RESET}`);
+        continue;
+      }
+      page++;
+      await loadPage();
       continue;
     }
 
-    // Otherwise treat as a selection list.
-    selected = parseSelection(trimmed);
+    // p → previous page
+    if (trimmed === "p") {
+      if (page <= 1) {
+        ctx.notify(`${YELLOW}  Already on the first page.${RESET}`);
+        continue;
+      }
+      page--;
+      await loadPage();
+      continue;
+    }
+
+    // /<terms> → filter search, reset to page 1
+    if (trimmed.startsWith("/")) {
+      query = trimmed.slice(1).trim();
+      page  = 1;
+      await loadPage();
+      continue;
+    }
+
+    // ?<n> → open detail pane for item n on the current page, then loop back
+    const previewMatch = trimmed.match(/^\?(\d+)$/);
+    if (previewMatch) {
+      const id  = parseInt(previewMatch[1], 10);
+      const pkg = currentPage.find((p) => p.id === id);
+      if (pkg) {
+        await showDetail(pkg, ctx.notify.bind(ctx));
+      } else {
+        ctx.notify(`${RED}  No item ${id} on this page.${RESET}`);
+      }
+      continue;
+    }
+
+    // 1,3,5 → parse as a selection list and break out of the browse loop
+    selected = parseSelection(trimmed, currentPage);
     if (selected.length === 0) {
       ctx.notify(
-        `${RED}No valid package numbers found — try again, or leave blank to exit.${RESET}`
+        `${RED}  Unknown input. Use n/p (pages), ?3 (preview), 1,3,5 (install), /doom (search).${RESET}`
       );
       continue;
     }
 
-    break; // valid selection obtained
+    break;
   }
 
-  // ── Confirmation ────────────────────────────────────────────────────────────
-
+  // ── Confirm ────────────────────────────────────────────────────────────────
   const summary = selected.map((p) => `  • ${GREEN}${p.name}${RESET}`).join("\n");
   ctx.notify(`\n${BOLD}You selected:${RESET}\n${summary}\n`);
 
@@ -396,8 +476,7 @@ async function extensionsCommand(ctx: PiContext): Promise<void> {
     return;
   }
 
-  // ── Install ─────────────────────────────────────────────────────────────────
-
+  // ── Install ────────────────────────────────────────────────────────────────
   const results: Array<{ pkg: Package; ok: boolean }> = [];
 
   for (const pkg of selected) {
@@ -405,8 +484,7 @@ async function extensionsCommand(ctx: PiContext): Promise<void> {
     results.push({ pkg, ok });
   }
 
-  // ── Report ──────────────────────────────────────────────────────────────────
-
+  // ── Report ─────────────────────────────────────────────────────────────────
   ctx.notify(`\n${BOLD}Results${RESET}`);
   ctx.notify(`${DIM}  ${"─".repeat(38)}${RESET}`);
 
@@ -436,7 +514,7 @@ async function extensionsCommand(ctx: PiContext): Promise<void> {
 export default function register(ctx: PiContext): void {
   ctx.registerCommand(
     "/extensions",
-    "Browse and install curated Pi community packages",
+    "Browse and install Pi community packages",
     () => extensionsCommand(ctx)
   );
 }
