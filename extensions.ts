@@ -404,6 +404,10 @@ function createBrowserComponent(
         refresh();
         return;
       }
+      if (matchesKey(data, Key.enter)) {
+        done({ action: "install", selected: [previewPkg.name] });
+        return;
+      }
       previewPkg = null;
       refresh();
       return;
@@ -527,6 +531,7 @@ function createBrowserComponent(
       const scrollHint = [
         canUp   ? theme.fg("accent", "↑ scroll up")   : theme.fg("dim", "↑ scroll up"),
         canDown ? theme.fg("accent", "↓ scroll down") : theme.fg("dim", "↓ scroll down"),
+        theme.fg(installed.has(pkg.name) ? "dim" : "accent", installed.has(pkg.name) ? "Enter=install/skip" : "Enter=install"),
         theme.fg("dim", "any other key=close"),
       ].join(theme.fg("dim", "  "));
       add(` ${scrollHint}`);
@@ -562,7 +567,7 @@ function createBrowserComponent(
     if (browseSelected.size > 0) {
       add(theme.fg("accent", ` ${browseSelected.size} selected: `) + theme.fg("dim", [...browseSelected].join(", ")));
     }
-    add(` ${["↑↓=move","Space=select","Enter=preview","←→/n·p=page","i=install","/=search","u=uninstall packages","Esc=exit"].map((h) => theme.fg("dim", h)).join(theme.fg("dim", "  "))}`);
+    add(` ${["↑↓=move","Space=select","Enter=preview","preview Enter=install","←→/n·p=page","i=install","/=search","u=uninstall packages","Esc=exit"].map((h) => theme.fg("dim", h)).join(theme.fg("dim", "  "))}`);
     add(sep);
   }
 

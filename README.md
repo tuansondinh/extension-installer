@@ -23,7 +23,7 @@ Run `/extensions` in pi to open the browser.
 | `↑` / `↓` | Move cursor |
 | `←` / `→` or `n` / `p` | Previous / next page |
 | `Space` | Toggle select package |
-| `Enter` | Preview readme + links |
+| `Enter` | Preview readme + links; press `Enter` again in preview to install |
 | `i` | Install selected (or cursor package if none selected) |
 | `/` | Search packages |
 | `u` | Switch to Manage Installed view |
