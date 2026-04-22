@@ -2,6 +2,8 @@
 
 Browse and install Pi community packages from within pi — an interactive TUI extension browser with arrow-key navigation, search, previews, and uninstall support.
 
+![Extension browser screenshot](./assets/extensions-browser.png)
+
 ## Install
 
 ```bash
