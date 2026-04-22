@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.0] - 2026-04-22
+
+### Features
+
+- Allow installing package directly from preview by pressing `Enter`
+
 ## [1.0.1] - 2026-04-22
 
 ### Bug Fixes
