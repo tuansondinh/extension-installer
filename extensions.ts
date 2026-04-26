@@ -334,12 +334,14 @@ function createBrowserComponent(
         return;
       }
       if (matchesKey(data, Key.up)) {
-        manageCursor = Math.max(0, manageCursor - 1);
+        const len = managePkgs.length;
+        if (len > 0) manageCursor = (manageCursor - 1 + len) % len;
         refresh();
         return;
       }
       if (matchesKey(data, Key.down)) {
-        manageCursor = Math.min(managePkgs.length - 1, manageCursor + 1);
+        const len = managePkgs.length;
+        if (len > 0) manageCursor = (manageCursor + 1) % len;
         refresh();
         return;
       }
@@ -379,6 +381,13 @@ function createBrowserComponent(
         return;
       }
       if (matchesKey(data, Key.backspace)) {
+        if (searchBuffer.length === 0) {
+          // Backspace on empty buffer exits search mode.
+          searchMode   = false;
+          searchBuffer = query;
+          refresh();
+          return;
+        }
         searchBuffer = searchBuffer.slice(0, -1);
         refresh();
         return;
@@ -400,7 +409,8 @@ function createBrowserComponent(
         return;
       }
       if (matchesKey(data, Key.down)) {
-        previewScroll = Math.min(Math.max(0, totalLines - PREVIEW_PAGE), previewScroll + 1);
+        // Upper bound is enforced at render time against wrapped line count.
+        previewScroll = previewScroll + 1;
         refresh();
         return;
       }
@@ -486,11 +496,40 @@ function createBrowserComponent(
     return lines;
   }
 
+  function wrapText(text: string, width: number): string[] {
+    if (width <= 0) return text.split("\n");
+    const out: string[] = [];
+    for (const raw of text.split("\n")) {
+      if (raw.length <= width) { out.push(raw); continue; }
+      // Preserve leading indent for wrapped continuation lines.
+      const indentMatch = raw.match(/^(\s*)/);
+      const indent = indentMatch ? indentMatch[1] : "";
+      const contWidth = Math.max(1, width - indent.length);
+      let rest = raw.slice(indent.length);
+      let first = true;
+      while (rest.length > 0) {
+        const limit = first ? width : contWidth;
+        if (rest.length <= limit) {
+          out.push((first ? "" : indent) + rest);
+          break;
+        }
+        // Find last space within limit for word-boundary wrap.
+        let cut = rest.lastIndexOf(" ", limit);
+        if (cut <= 0) cut = limit;
+        out.push((first ? "" : indent) + rest.slice(0, cut).replace(/\s+$/, ""));
+        rest = rest.slice(cut).replace(/^\s+/, "");
+        first = false;
+      }
+      if (rest.length === 0 && raw.endsWith("")) { /* noop */ }
+    }
+    return out;
+  }
+
   function renderBrowse(
     lines: string[],
     add: (s: string) => void,
     sep: string,
-    _width: number
+    width: number
   ) {
     add(sep);
     const headerRight = loading
@@ -511,11 +550,15 @@ function createBrowserComponent(
 
     if (previewPkg) {
       const pkg        = previewPkg;
-      const textLines  = previewText.split("\n");
+      // Wrap to inner width (account for leading " " added by add()).
+      const innerWidth = Math.max(10, width - 1);
+      const textLines  = wrapText(previewText, innerWidth);
       const totalLines = textLines.length;
+      const maxScroll  = Math.max(0, totalLines - PREVIEW_PAGE);
+      if (previewScroll > maxScroll) previewScroll = maxScroll;
       const visLines   = textLines.slice(previewScroll, previewScroll + PREVIEW_PAGE);
       const canUp      = previewScroll > 0;
-      const canDown    = previewScroll + PREVIEW_PAGE < totalLines;
+      const canDown    = previewScroll < maxScroll;
 
       add(theme.bold(theme.fg("success", ` ${pkg.name}`)) +
         (pkg.downloads !== undefined ? theme.fg("dim", `  ${formatDownloads(pkg.downloads)}`) : "") +
@@ -567,7 +610,17 @@ function createBrowserComponent(
     if (browseSelected.size > 0) {
       add(theme.fg("accent", ` ${browseSelected.size} selected: `) + theme.fg("dim", [...browseSelected].join(", ")));
     }
-    add(` ${["↑↓=move","Space=select","Enter=preview","preview Enter=install","←→/n·p=page","i=install","/=search","u=uninstall packages","Esc=exit"].map((h) => theme.fg("dim", h)).join(theme.fg("dim", "  "))}`);
+    const hints = [
+      { text: "/=search", highlight: true },
+      "↑↓=move",
+      "Space=select",
+      "Enter=preview",
+      "←→/n·p=page",
+      "i=install",
+      "u=uninstall packages",
+      "Esc=exit",
+    ];
+    add(` ${hints.map((h) => typeof h === "string" ? theme.fg("dim", h) : theme.bold(theme.fg("accent", h.text))).join(theme.fg("dim", "  "))}`);
     add(sep);
   }
 
@@ -629,40 +682,49 @@ async function runExtensionsCommand(pi: ExtensionAPI, ctx: PiCtx): Promise<void>
     return;
   }
 
-  const result = await ctx.ui.custom<BrowserResult | null>(
-    (tui: { requestRender: () => void }, theme: { fg: (c: string, t: string) => string; bold: (t: string) => string; bg: (c: string, t: string) => string }, _kb: unknown, done: (v: BrowserResult | null) => void) =>
-      createBrowserComponent(tui, theme, done)
-  );
-
-  if (!result) return;
-
-  if (result.action === "install" && result.selected.length > 0) {
-    const confirmed = await ctx.ui.confirm("Install packages?", result.selected.join(", "));
-    if (!confirmed) return;
-
-    ctx.ui.notify(`Installing ${result.selected.length} package(s)…`, "info");
-    const results = await installPackages(pi, result.selected, (l) => ctx.ui.notify(l, "info"));
-    const failed  = [...results.entries()].filter(([, ok]) => !ok).map(([n]) => n);
-    const success = [...results.entries()].filter(([, ok]) =>  ok).map(([n]) => n);
-    if (success.length) ctx.ui.notify(`✓ Installed: ${success.join(", ")}`, "info");
-    if (failed.length)  ctx.ui.notify(`✗ Failed: ${failed.join(", ")}`, "error");
-    if (success.length) ctx.ui.notify("Run /reload to activate newly installed extensions.", "info");
-  }
-
-  if (result.action === "uninstall" && result.selected.length > 0) {
-    const confirmed = await ctx.ui.confirm(
-      "Uninstall packages?",
-      `This will remove: ${result.selected.join(", ")}`
+  // Loop so the browser reopens after each install/uninstall action.
+  // Exit only when the user closes the browser (result === null).
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    const result = await ctx.ui.custom<BrowserResult | null>(
+      (tui: { requestRender: () => void }, theme: { fg: (c: string, t: string) => string; bold: (t: string) => string; bg: (c: string, t: string) => string }, _kb: unknown, done: (v: BrowserResult | null) => void) =>
+        createBrowserComponent(tui, theme, done)
     );
-    if (!confirmed) return;
 
-    ctx.ui.notify(`Uninstalling ${result.selected.length} package(s)…`, "info");
-    const results = await uninstallPackages(pi, result.selected, (l) => ctx.ui.notify(l, "info"));
-    const failed  = [...results.entries()].filter(([, ok]) => !ok).map(([n]) => n);
-    const success = [...results.entries()].filter(([, ok]) =>  ok).map(([n]) => n);
-    if (success.length) ctx.ui.notify(`✓ Removed: ${success.join(", ")}`, "info");
-    if (failed.length)  ctx.ui.notify(`✗ Failed: ${failed.join(", ")}`, "error");
-    if (success.length) ctx.ui.notify("Run /reload to apply changes.", "info");
+    if (!result) return;
+
+    if (result.action === "install" && result.selected.length > 0) {
+      const confirmed = await ctx.ui.confirm("Install packages?", result.selected.join(", "));
+      if (confirmed) {
+        ctx.ui.notify(`Installing ${result.selected.length} package(s)…`, "info");
+        const results = await installPackages(pi, result.selected, (l) => ctx.ui.notify(l, "info"));
+        const failed  = [...results.entries()].filter(([, ok]) => !ok).map(([n]) => n);
+        const success = [...results.entries()].filter(([, ok]) =>  ok).map(([n]) => n);
+        if (success.length) ctx.ui.notify(`✓ Installed: ${success.join(", ")}`, "info");
+        if (failed.length)  ctx.ui.notify(`✗ Failed: ${failed.join(", ")}`, "error");
+        if (success.length) ctx.ui.notify("Run /reload to activate newly installed extensions.", "info");
+      }
+      continue;
+    }
+
+    if (result.action === "uninstall" && result.selected.length > 0) {
+      const confirmed = await ctx.ui.confirm(
+        "Uninstall packages?",
+        `This will remove: ${result.selected.join(", ")}`
+      );
+      if (confirmed) {
+        ctx.ui.notify(`Uninstalling ${result.selected.length} package(s)…`, "info");
+        const results = await uninstallPackages(pi, result.selected, (l) => ctx.ui.notify(l, "info"));
+        const failed  = [...results.entries()].filter(([, ok]) => !ok).map(([n]) => n);
+        const success = [...results.entries()].filter(([, ok]) =>  ok).map(([n]) => n);
+        if (success.length) ctx.ui.notify(`✓ Removed: ${success.join(", ")}`, "info");
+        if (failed.length)  ctx.ui.notify(`✗ Failed: ${failed.join(", ")}`, "error");
+        if (success.length) ctx.ui.notify("Run /reload to apply changes.", "info");
+      }
+      continue;
+    }
+
+    // Unknown action / empty selection — reopen browser.
   }
 }
 

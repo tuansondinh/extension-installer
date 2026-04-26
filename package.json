@@ -1,6 +1,6 @@
 {
   "name": "pi-extension-installer",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "Browse and install Pi community packages — interactive TUI browser with arrow-key navigation, search, previews, install, and uninstall support.",
   "keywords": [
     "pi-package",

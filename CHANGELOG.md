@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.1.2] - 2026-04-26
+
+### Features
+
+- Wrap long preview lines to viewport width instead of truncating
+- Browser reopens after install/uninstall instead of exiting
+- Highlight `/=search` in hint bar
+
+### Bug Fixes
+
+- Cursor in manage view wraps around at top/bottom
+- Preview scroll bound enforced against wrapped line count
+- Backspace on empty search buffer exits search mode
+
 ## [1.1.1] - 2026-04-23
 
 ### Other
